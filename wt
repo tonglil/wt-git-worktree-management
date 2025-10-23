@@ -1,0 +1,328 @@
+#!/bin/bash
+
+# wt - Git worktree management helper
+
+set -e
+
+# Show usage information
+usage() {
+    cat << EOF
+Usage: wt <command> [options]
+
+Commands:
+  list, ls          List all worktrees (alias for 'git worktree list')
+  add               Add a new worktree with optional base branch
+                    Usage: wt add <path> [<branch>] [<base-branch>]
+                    If base-branch is provided, branch will be created from it
+  remove, rm        Remove a worktree (alias for 'git worktree remove')
+  del               Remove a worktree and delete its branch
+  prune             Prune worktree information (alias for 'git worktree prune')
+  move, mv          Move a worktree (alias for 'git worktree move')
+  lock              Lock a worktree (alias for 'git worktree lock')
+  unlock            Unlock a worktree (alias for 'git worktree unlock')
+  repair            Repair worktree (alias for 'git worktree repair')
+
+  gone              List worktrees whose upstream branch is gone
+  cleanup           Remove worktrees whose upstream branch is gone
+                    Options: -n, --dry-run (show only, do not remove)
+  use <path>        Switch to an existing worktree directory
+                    Example: wt use _w/my-feature
+  new <branch>      Create a new worktree with branch prefix 'tl/'
+                    Example: wt new my-feature
+                    Creates: _w/my-feature with branch tl/my-feature
+                    Defaults to creating branch from origin/main
+
+  help, -h, --help  Show this help message
+EOF
+}
+
+# List worktrees whose upstream branch is gone
+gone() {
+    local worktrees=$(git worktree list --porcelain)
+    local current_worktree=""
+    local current_branch=""
+    local current_path=""
+    local current_commit=""
+
+    while IFS= read -r line; do
+        if [[ $line == worktree* ]]; then
+            current_path="${line#worktree }"
+        elif [[ $line == HEAD* ]]; then
+            current_commit="${line#HEAD }"
+            current_commit="${current_commit:0:8}"
+        elif [[ $line == branch* ]]; then
+            current_branch="${line#branch refs/heads/}"
+
+            # Check if the upstream is gone
+            if [ -n "$current_branch" ]; then
+                # Get the upstream branch status
+                local upstream=$(git -C "$current_path" rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
+
+                if [ -n "$upstream" ]; then
+                    # Check if upstream exists
+                    if ! git -C "$current_path" rev-parse --verify "$upstream" &>/dev/null; then
+                        echo "$current_path	$current_commit [$current_branch]"
+                    fi
+                fi
+            fi
+        elif [[ -z $line ]]; then
+            # Reset for next worktree
+            current_worktree=""
+            current_branch=""
+            current_path=""
+            current_commit=""
+        fi
+    done <<< "$worktrees"
+}
+
+# Remove worktrees whose upstream branch is gone
+cleanup() {
+    local dry_run=false
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                dry_run=true
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Usage: wt cleanup [-n|--dry-run]"
+                exit 1
+                ;;
+        esac
+    done
+
+    local worktrees=$(git worktree list --porcelain)
+    local current_path=""
+    local current_branch=""
+    local to_remove=()
+
+    while IFS= read -r line; do
+        if [[ $line == worktree* ]]; then
+            current_path="${line#worktree }"
+        elif [[ $line == branch* ]]; then
+            current_branch="${line#branch refs/heads/}"
+
+            # Check if the upstream is gone
+            if [ -n "$current_branch" ]; then
+                # Get the upstream branch status
+                local upstream=$(git -C "$current_path" rev-parse --abbrev-ref "$current_branch@{upstream}" 2>/dev/null || echo "")
+
+                if [ -n "$upstream" ]; then
+                    # Check if upstream exists
+                    if ! git -C "$current_path" rev-parse --verify "$upstream" &>/dev/null; then
+                        to_remove+=("$current_path")
+                    fi
+                fi
+            fi
+        elif [[ -z $line ]]; then
+            # Reset for next worktree
+            current_path=""
+            current_branch=""
+        fi
+    done <<< "$worktrees"
+
+    # If no worktrees to remove
+    if [ ${#to_remove[@]} -eq 0 ]; then
+        echo "No worktrees with gone upstream branches found."
+        return 0
+    fi
+
+    # Display worktrees to be removed
+    if [ "$dry_run" = true ]; then
+        echo "Worktrees that would be removed:"
+        for path in "${to_remove[@]}"; do
+            echo "  $path"
+        done
+        return 0
+    fi
+
+    # Show what will be removed and ask for confirmation
+    echo "The following worktrees will be removed:"
+    for path in "${to_remove[@]}"; do
+        echo "  $path"
+    done
+    echo ""
+    read -p "Continue? (y/N) " -n 1 -r
+    echo ""
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        return 1
+    fi
+
+    # Remove worktrees
+    for path in "${to_remove[@]}"; do
+        echo "Removing $path..."
+        git worktree remove "$path" --force
+    done
+
+    echo "Done. Removed ${#to_remove[@]} worktree(s)."
+}
+
+# Remove a worktree and delete its branch
+del() {
+    if [ -z "$1" ]; then
+        echo "Error: worktree path required"
+        echo "Usage: wt del <worktree-path>"
+        exit 1
+    fi
+
+    local worktree_path="$1"
+
+    # Get the branch name for this worktree
+    local branch=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+        echo "Error: Could not determine branch for worktree at $worktree_path"
+        exit 1
+    fi
+
+    echo "Removing worktree at $worktree_path..."
+    git worktree remove "$worktree_path" --force
+
+    echo "Deleting branch $branch..."
+    git branch -D "$branch"
+
+    echo "Done. Removed worktree and deleted branch $branch."
+}
+
+# Switch to an existing worktree directory
+use() {
+    if [ -z "$1" ]; then
+        echo "Error: worktree path required"
+        echo "Usage: wt use <worktree-path>"
+        exit 1
+    fi
+
+    local worktree_path="$1"
+
+    # Verify the path is actually a worktree
+    if ! git worktree list --porcelain 2>/dev/null | grep -q "^worktree $worktree_path$"; then
+        echo "Error: $worktree_path is not a valid worktree"
+        exit 1
+    fi
+
+    echo "Changing directory to ${worktree_path}..."
+    cd "$worktree_path"
+
+    # Execute a new login shell in the new directory (sources ~/.bash_profile)
+    exec "${SHELL:-/bin/bash}" -l
+}
+
+# Create a new worktree with tl/ prefix
+new() {
+    if [ -z "$1" ]; then
+        echo "Error: branch name required"
+        echo "Usage: wt new <branch>"
+        exit 1
+    fi
+
+    local branch_name="$1"
+    local prefixed_branch="tl/${branch_name}"
+
+    # Get the repository root directory
+    local repo_root=$(git rev-parse --show-toplevel)
+    local worktree_path="${repo_root}/_w/${branch_name}"
+
+    echo "Creating worktree at ${worktree_path} with branch ${prefixed_branch} from origin/main..."
+    git worktree add "$worktree_path" -b "$prefixed_branch" origin/main
+
+    echo "Changing directory to ${worktree_path}..."
+    cd "$worktree_path"
+
+    # Execute a new login shell in the new directory (sources ~/.bash_profile)
+    exec "${SHELL:-/bin/bash}" -l
+}
+
+# Main command handler
+main() {
+    if [ $# -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    case "$1" in
+        list|ls)
+            shift
+            git worktree list "$@"
+            ;;
+        add)
+            shift
+            # Check if we have at least 2 arguments and the third one exists (base branch)
+            if [ $# -ge 3 ]; then
+                local path="$1"
+                local branch="$2"
+                local base_branch="$3"
+                shift 3
+
+                # Check if branch exists
+                if git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+                    # Branch exists, use it
+                    git worktree add "$path" "$branch" "$@"
+                else
+                    # Branch doesn't exist, create it from base branch
+                    echo "Creating branch $branch from $base_branch..."
+                    git worktree add "$path" -b "$branch" "$base_branch" "$@"
+                fi
+            else
+                # Pass through to git worktree add for standard usage
+                git worktree add "$@"
+            fi
+            ;;
+        remove|rm)
+            shift
+            git worktree remove "$@"
+            ;;
+        del)
+            shift
+            del "$@"
+            ;;
+        prune)
+            shift
+            git worktree prune "$@"
+            ;;
+        move|mv)
+            shift
+            git worktree move "$@"
+            ;;
+        lock)
+            shift
+            git worktree lock "$@"
+            ;;
+        unlock)
+            shift
+            git worktree unlock "$@"
+            ;;
+        repair)
+            shift
+            git worktree repair "$@"
+            ;;
+        gone)
+            gone
+            ;;
+        cleanup)
+            shift
+            cleanup "$@"
+            ;;
+        use)
+            shift
+            use "$@"
+            ;;
+        new)
+            shift
+            new "$@"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            # Pass through to git worktree for any other commands
+            git worktree "$@"
+            ;;
+    esac
+}
+
+main "$@"
